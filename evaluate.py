@@ -1,9 +1,16 @@
+import os
+import pickle
 import random
+from datetime import datetime
+
 import numpy as np
 import torch
+from tqdm import tqdm
+
 from datasets.argoverse.dataset import ArgoH5Dataset
 from datasets.interaction_dataset.dataset import InteractionDataset
 from datasets.nuscenes.dataset import NuscenesH5Dataset
+from datasets.synth.dataset import SynthV1Dataset
 from datasets.trajnetpp.dataset import TrajNetPPDataset
 from models.autobot_ego import AutoBotEgo
 from models.autobot_joint import AutoBotJoint
@@ -47,6 +54,13 @@ class Evaluator:
         elif "Argoverse" in self.model_config.dataset:
             val_dset = ArgoH5Dataset(dset_path=self.args.dataset_path, split_name="val",
                                      use_map_lanes=self.model_config.use_map_lanes)
+
+        elif "synth" == self.model_config.dataset:
+            assert self.args.synth_v1_subset_filename is not None
+            assert type(self.args.synth_v1_subset_filename) == str
+            assert len(self.args.synth_v1_subset_filename) > 0
+            val_dset = SynthV1Dataset(dset_path=self.model_config.dataset_path,
+                                      filename=self.args.synth_v1_subset_filename)
 
         else:
             raise NotImplementedError
@@ -108,8 +122,12 @@ class Evaluator:
         num_params = sum([np.prod(p.size()) for p in model_parameters])
         print("Number of Model Parameters:", num_params)
 
-    def _data_to_device(self, data):
-        if "Joint" in self.model_config.model_type:
+    def _data_to_device(self, data, model_type_overwrite=None):
+        model_type = self.model_config.model_type
+        if model_type_overwrite is not None:
+            model_type = model_type_overwrite
+
+        if "Joint" in model_type:
             ego_in, ego_out, agents_in, agents_out, context_img, agent_types = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -119,7 +137,7 @@ class Evaluator:
             agent_types = agent_types.float().to(self.device)
             return ego_in, ego_out, agents_in, agents_out, context_img, agent_types
 
-        elif "Ego" in self.model_config.model_type:
+        elif "Ego" in model_type:
             ego_in, ego_out, agents_in, roads = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -242,10 +260,20 @@ class Evaluator:
             for i, data in enumerate(self.val_loader):
                 if i % 50 == 0:
                     print(i, "/", len(self.val_loader.dataset) // self.args.batch_size)
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
 
-                # encode observations
-                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+                if self.model_config.dataset == "synth" or "trajnet++" in self.model_config.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, agent_types = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
+                if "Ego" in self.model_config.model_type:
+                    pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+                elif "Joint" in self.model_config.model_type:
+                    pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, context_img, agent_types)
+                    pred_obs = pred_obs[:, :, :, 0, :]
+                else:
+                    raise ValueError
 
                 ade_losses, fde_losses = self._compute_ego_errors(pred_obs, ego_out)
                 val_ade_losses.append(ade_losses)
@@ -267,8 +295,12 @@ class Evaluator:
 
     def evaluate(self):
         if "Joint" in self.model_config.model_type:
+            print(" EGO")
+            self.autobotego_evaluate()
+            print(" JOINT")
             self.autobotjoint_evaluate()
         elif "Ego" in self.model_config.model_type:
+            print(" EGO")
             self.autobotego_evaluate()
         else:
             raise NotImplementedError

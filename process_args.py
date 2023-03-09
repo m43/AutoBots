@@ -78,6 +78,8 @@ def get_eval_args():
     parser.add_argument("--dataset-path", type=str, required=True, help="Dataset path.")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size")
     parser.add_argument("--disable-cuda", action="store_true", help="Disable CUDA")
+    parser.add_argument("--synth-v1-subset-filename", type=str, default="val.npy",
+                        help="Filename of the synth-v1 subset to use for evaluation.")
     args = parser.parse_args()
 
     config, model_dirname = load_config(args.models_path)
