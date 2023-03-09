@@ -1,13 +1,13 @@
 import argparse
-import os
-import numpy as np
-import trajnetplusplustools
 import math
+import os
+import pickle
 
+import numpy as np
+from tqdm import tqdm
 
 '''
-This is only for the synthetic portion of the TrajNet++ dataset. It can be modified to also create files for the real 
-portion.
+Preprocess Synth-v1 into the format used by autobots.
 '''
 
 
@@ -20,21 +20,12 @@ def drop_distant(xy, max_num_peds=5):
     return xy[:, np.argsort(smallest_dist_to_ego)[:(max_num_peds)]]
 
 
-def drop_inactive(xy, obs_horizon=9):
-    """
-    Only keep agents that are active at the last timestep in the past.
-    """
-    return xy[:, ~np.isnan(xy[obs_horizon-1, :, 0])]
-
-
 def shift(xy, center):
-    # theta = random.random() * 2.0 * math.pi
     xy = xy - center[np.newaxis, np.newaxis, :]
     return xy
 
 
 def theta_rotation(xy, theta):
-    # theta = random.random() * 2.0 * math.pi
     ct = math.cos(theta)
     st = math.sin(theta)
 
@@ -42,7 +33,7 @@ def theta_rotation(xy, theta):
     return np.einsum('ptc,ci->pti', xy, r)
 
 
-def center_scene(xy, obs_length=9, ped_id=0):
+def center_scene(xy, obs_length=8, ped_id=0):
     ## Center
     center = xy[obs_length - 1, ped_id]  ## Last Observation
     xy = shift(xy, center)
@@ -57,60 +48,36 @@ def center_scene(xy, obs_length=9, ped_id=0):
     return xy, rotation, center
 
 
-def inverse_scene(xy, rotation, center):
-    xy = theta_rotation(xy, -rotation)
-    xy = shift(xy, -center)
-    return xy
-
-
-def get_args():
-    parser = argparse.ArgumentParser(description="TrajNet++ NPY Creator")
-    parser.add_argument("--output-npy-path", type=str, required=True, help="output path to H5 files.")
-    parser.add_argument("--raw-dataset-path", type=str, required=True, help="raw Dataset path to .../synth_data.")
-    args = parser.parse_args()
-    return args
-
-
-def prepare_data(raw_path, out_path):
-    N = 6
-    files = [f.split('.')[-2] for f in os.listdir(raw_path) if f.endswith('.ndjson')]
-    for file in files:
-        reader = trajnetplusplustools.Reader(raw_path + file + '.ndjson', scene_type='tags')
-        scene = [(file, s_id, s_tag, xypaths) for s_id, s_tag, xypaths in reader.scenes(sample=1.0)]
-
-        val_len = int(len(scene)*0.1)
-        train_len = len(scene) - val_len
-        val_file_data = np.zeros((val_len, 21, N, 2))
-        train_file_data = np.zeros((train_len, 21, N, 2))
-        largest_num_agents = 0.0
-        for scene_i, (filename, scene_id, s_tag, curr_scene) in enumerate(scene):
-            curr_scene = drop_distant(curr_scene, max_num_peds=N)
-            curr_scene, _, _ = center_scene(curr_scene)
-
-            if curr_scene.shape[1] > largest_num_agents:
-                largest_num_agents = curr_scene.shape[1]
-
-            if curr_scene.shape[1] < N:
-                # Need to pad array to have shape 21xNx2
-                temp_curr_scene = np.zeros((21, N, 2))
-                temp_curr_scene[:, :, :] = np.nan
-                temp_curr_scene[:, :curr_scene.shape[1], :] = curr_scene
-                curr_scene = temp_curr_scene.copy()
-
-            if scene_i < val_len:
-                val_file_data[scene_i] = curr_scene
-            else:
-                train_file_data[scene_i - val_len] = curr_scene
-
-        np.save(os.path.join(out_path, "val_"+file+".npy"), val_file_data)
-        np.save(os.path.join(out_path, "train_"+file+".npy"), train_file_data)
-        del val_file_data
-        del train_file_data
-        del scene
-        del reader
-        print("FILE", file, "Largest_num_agents", largest_num_agents)
+def prepare_data(raw_path, out_path, max_number_of_agents):
+    with open(raw_path, "rb") as f:
+        dataset = pickle.load(f)
+    data = np.zeros((len(dataset["scenes"]), 20, max_number_of_agents, 2))
+    largest_number_of_agents = 0
+    for scene_idx, scene in enumerate(tqdm(dataset["scenes"])):
+        trajectories = scene["trajectories"].transpose((1, 0, 2))
+        assert len(trajectories) == 20
+        if trajectories.shape[1] > largest_number_of_agents:
+            largest_number_of_agents = trajectories.shape[1]
+        trajectories = drop_distant(trajectories, max_num_peds=max_number_of_agents)
+        trajectories, rotation, center = center_scene(trajectories)
+        if trajectories.shape[1] < max_number_of_agents:
+            tmp_trajectories = np.zeros((20, max_number_of_agents, 2))
+            tmp_trajectories[:, :, :] = np.nan
+            tmp_trajectories[:, :trajectories.shape[1], :] = trajectories
+            trajectories = tmp_trajectories.copy()
+        data[scene_idx] = trajectories
+    np.save(out_path, data)
+    print(f"Saved to {os.path.abspath(out_path)}")
+    print(f"Largest number of agents in any scene: {largest_number_of_agents}")
+    print(f"Maximum number of agents taken into account: {max_number_of_agents}")
 
 
 if __name__ == "__main__":
-    args = get_args()
-    prepare_data(raw_path=args.raw_dataset_path, out_path=args.output_npy_path)
+    parser = argparse.ArgumentParser(description="Synth-v1 Dataset Preprocessor.")
+    parser.add_argument("--raw-dataset-path", type=str, required=True, help="Raw Synth-v1 pickle path.")
+    parser.add_argument("--output-npy-path", type=str, required=True, help="Path to .npy to be outputted.")
+    parser.add_argument("--max-number-of-agents", type=int, default=12, help="The maximum number of agents per scene")
+    args = parser.parse_args()
+    prepare_data(raw_path=args.raw_dataset_path, out_path=args.output_npy_path,
+                 max_number_of_agents=args.max_number_of_agents)
+    print("Done.")
