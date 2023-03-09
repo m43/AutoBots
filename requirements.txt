@@ -10,3 +10,6 @@ scipy==1.7.1
 torch==1.9.0
 torchvision==0.10.0
 trajnetplusplustools==0.3.0
+tensorboard~=2.11.2
+tqdm~=4.65.0
+setuptools==59.5.0
