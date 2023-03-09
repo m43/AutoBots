@@ -14,7 +14,7 @@ def get_train_args():
 
     # Section: Dataset
     parser.add_argument("--dataset", type=str, required=True, choices=["Argoverse", "Nuscenes", "trajnet++",
-                                                                       "interaction-dataset"],
+                                                                       "interaction-dataset", "synth"],
                         help="Dataset to train on.")
     parser.add_argument("--dataset-path", type=str, required=True, help="Path to dataset files.")
     parser.add_argument("--use-map-image", type=bool, default=False, help="Use map image if applicable.")
@@ -47,7 +47,8 @@ def get_train_args():
     parser.add_argument("--learning-rate-sched", type=int, nargs='+', default=[5, 10, 15, 20],
                         help="Learning rate Schedule.")
     parser.add_argument("--grad-clip-norm", type=float, default=5, metavar="C", help="Gradient clipping norm")
-    parser.add_argument("--num-epochs", type=int, default=150, metavar="I", help="number of iterations through the dataset.")
+    parser.add_argument("--num-epochs", type=int, default=150, metavar="I",
+                        help="number of iterations through the dataset.")
     args = parser.parse_args()
 
     if args.use_map_image and args.use_map_lanes:
@@ -62,6 +63,8 @@ def get_train_args():
     elif "interaction-dataset" in args.dataset:
         assert "Ego" not in args.model_type, "Can't run AutoBot-Ego on Interaction Dataset..."
         assert not args.use_map_image, "Interaction-dataset does not have image-based scene information..."
+    elif args.dataset == "synth":
+        assert not args.use_map_image and not args.use_map_lanes, "Synth-v1 has no scene map information..."
 
     results_dirname = create_results_folder(args)
     save_config(args, results_dirname)
@@ -75,6 +78,13 @@ def get_eval_args():
     parser.add_argument("--dataset-path", type=str, required=True, help="Dataset path.")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size")
     parser.add_argument("--disable-cuda", action="store_true", help="Disable CUDA")
+    parser.add_argument("--synth-v1-subset-filename", type=str, default="val.npy",
+                        help="Filename of the synth-v1 subset to use for evaluation.")
+    parser.add_argument("--synth-v1-cf-evaluation", action="store_true",
+                        help="Whether to run the counterfactual evaluation instead of the standard evaluation")
+    parser.add_argument("--synth-v1-cf-evaluation-raw-synthv1-path", type=str,
+                        default="data/synth_v1.a.filtered.test.pkl",
+                        help="The relative path to the raw synth v1 dataset to run counterfactual evaluation on.")
     args = parser.parse_args()
 
     config, model_dirname = load_config(args.models_path)

@@ -1,22 +1,21 @@
 import os
-
-import numpy as np
 import random
 
-from datasets.argoverse.dataset import ArgoH5Dataset
-from datasets.interaction_dataset.dataset import InteractionDataset
-from datasets.trajnetpp.dataset import TrajNetPPDataset
-from models.autobot_joint import AutoBotJoint
-from process_args import get_train_args
-
-from datasets.nuscenes.dataset import NuscenesH5Dataset
-from models.autobot_ego import AutoBotEgo
+import numpy as np
 import torch
 import torch.distributions as D
 from torch import optim, nn
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.tensorboard import SummaryWriter
 
+from datasets.argoverse.dataset import ArgoH5Dataset
+from datasets.interaction_dataset.dataset import InteractionDataset
+from datasets.nuscenes.dataset import NuscenesH5Dataset
+from datasets.synth.dataset import SynthV1Dataset
+from datasets.trajnetpp.dataset import TrajNetPPDataset
+from models.autobot_ego import AutoBotEgo
+from models.autobot_joint import AutoBotJoint
+from process_args import get_train_args
 from utils.metric_helpers import min_xde_K
 from utils.train_helpers import nll_loss_multimodes, nll_loss_multimodes_joint
 
@@ -69,6 +68,11 @@ class Trainer:
                                        use_map_lanes=self.args.use_map_lanes)
             val_dset = ArgoH5Dataset(dset_path=self.args.dataset_path, split_name="val",
                                      use_map_lanes=self.args.use_map_lanes)
+
+        elif self.args.dataset == "synth":
+            # TODO: Note that early stopping is hardcoded to run on the small validation subset, val.300.npy
+            train_dset = SynthV1Dataset(dset_path=self.args.dataset_path, filename="train.npy")
+            val_dset = SynthV1Dataset(dset_path=self.args.dataset_path, filename="val.300.npy")
 
         else:
             raise NotImplementedError
@@ -125,8 +129,12 @@ class Trainer:
         else:
             raise NotImplementedError
 
-    def _data_to_device(self, data):
-        if "Joint" in self.args.model_type:
+    def _data_to_device(self, data, model_type_overwrite=None):
+        model_type = self.args.model_type
+        if model_type_overwrite is not None:
+            model_type = model_type_overwrite
+
+        if "Joint" in model_type:
             ego_in, ego_out, agents_in, agents_out, context_img, agent_types = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -136,7 +144,7 @@ class Trainer:
             agent_types = agent_types.float().to(self.device)
             return ego_in, ego_out, agents_in, agents_out, context_img, agent_types
 
-        elif "Ego" in self.args.model_type:
+        elif "Ego" in model_type:
             ego_in, ego_out, agents_in, roads = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -188,7 +196,13 @@ class Trainer:
             epoch_fde_losses = []
             epoch_mode_probs = []
             for i, data in enumerate(self.train_loader):
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
+                if self.args.dataset == "synth" or "trajnet++" in self.args.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, _ = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
                 pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
 
                 nll_loss, kl_loss, post_entropy, adefde_loss = nll_loss_multimodes(pred_obs, ego_out[:, :, :2], mode_probs,
@@ -253,7 +267,11 @@ class Trainer:
             val_fde_losses = []
             val_mode_probs = []
             for i, data in enumerate(self.val_loader):
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+                if self.args.dataset == "synth" or "trajnet++" in self.args.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, _ = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
 
                 # encode observations
                 pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)

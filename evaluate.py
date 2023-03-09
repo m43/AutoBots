@@ -1,9 +1,16 @@
+import os
+import pickle
 import random
+from datetime import datetime
+
 import numpy as np
 import torch
+from tqdm import tqdm
+
 from datasets.argoverse.dataset import ArgoH5Dataset
 from datasets.interaction_dataset.dataset import InteractionDataset
 from datasets.nuscenes.dataset import NuscenesH5Dataset
+from datasets.synth.dataset import SynthV1Dataset
 from datasets.trajnetpp.dataset import TrajNetPPDataset
 from models.autobot_ego import AutoBotEgo
 from models.autobot_joint import AutoBotJoint
@@ -47,6 +54,13 @@ class Evaluator:
         elif "Argoverse" in self.model_config.dataset:
             val_dset = ArgoH5Dataset(dset_path=self.args.dataset_path, split_name="val",
                                      use_map_lanes=self.model_config.use_map_lanes)
+
+        elif "synth" == self.model_config.dataset:
+            assert self.args.synth_v1_subset_filename is not None
+            assert type(self.args.synth_v1_subset_filename) == str
+            assert len(self.args.synth_v1_subset_filename) > 0
+            val_dset = SynthV1Dataset(dset_path=self.model_config.dataset_path,
+                                      filename=self.args.synth_v1_subset_filename)
 
         else:
             raise NotImplementedError
@@ -108,8 +122,12 @@ class Evaluator:
         num_params = sum([np.prod(p.size()) for p in model_parameters])
         print("Number of Model Parameters:", num_params)
 
-    def _data_to_device(self, data):
-        if "Joint" in self.model_config.model_type:
+    def _data_to_device(self, data, model_type_overwrite=None):
+        model_type = self.model_config.model_type
+        if model_type_overwrite is not None:
+            model_type = model_type_overwrite
+
+        if "Joint" in model_type:
             ego_in, ego_out, agents_in, agents_out, context_img, agent_types = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -119,7 +137,7 @@ class Evaluator:
             agent_types = agent_types.float().to(self.device)
             return ego_in, ego_out, agents_in, agents_out, context_img, agent_types
 
-        elif "Ego" in self.model_config.model_type:
+        elif "Ego" in model_type:
             ego_in, ego_out, agents_in, roads = data
             ego_in = ego_in.float().to(self.device)
             ego_out = ego_out.float().to(self.device)
@@ -242,10 +260,20 @@ class Evaluator:
             for i, data in enumerate(self.val_loader):
                 if i % 50 == 0:
                     print(i, "/", len(self.val_loader.dataset) // self.args.batch_size)
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
 
-                # encode observations
-                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+                if self.model_config.dataset == "synth" or "trajnet++" in self.model_config.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, agent_types = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
+                if "Ego" in self.model_config.model_type:
+                    pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+                elif "Joint" in self.model_config.model_type:
+                    pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, context_img, agent_types)
+                    pred_obs = pred_obs[:, :, :, 0, :]
+                else:
+                    raise ValueError
 
                 ade_losses, fde_losses = self._compute_ego_errors(pred_obs, ego_out)
                 val_ade_losses.append(ade_losses)
@@ -265,10 +293,113 @@ class Evaluator:
                   "minADE_10", val_minade_10[0], "minADE_5", val_minade_5[0],
                   "minFDE_{}:".format(self.model_config.num_modes), val_minfde_c[0], "minFDE_1:", val_minfde_1[0])
 
+    def counterfactual_evaluate(self):
+        raw_synthv1_path = self.args.synth_v1_cf_evaluation_raw_synthv1_path
+        print(f"Counterfactual evaluation will use the raw dataset at: `{os.path.abspath(raw_synthv1_path)}`")
+        with open(raw_synthv1_path, "rb") as f:
+            dataset = pickle.load(f)
+
+        # TODO batchify to make it faster
+        # TODO refactor counterfactual evaluation, e.g. move it to a separate evaluator
+        all_future_trajectories = {}
+        for scene_idx, scene in enumerate(tqdm(dataset["scenes"])):
+            # Factual scene
+            f_traj = scene["trajectories"].transpose((1, 0, 2))
+            f_traj_dicts = self._create_traj_dicts(f_traj)
+
+            # Counterfactual scenes
+            cf_traj_list = [cf_traj.transpose((1, 0, 2)) for cf_traj in scene["remove_agent_i_trajectories"][1:]]
+            cf_traj_dicts_list = [{}] + [self._create_traj_dicts(cf_traj) for cf_traj in cf_traj_list]
+
+            all_future_trajectories[scene_idx] = {}
+            all_future_trajectories[scene_idx][7] = {
+                "factual": f_traj_dicts,
+                "counterfactuals": cf_traj_dicts_list,
+                "causal_effects": scene["remove_agent_i_ade"],
+            }
+
+        timestamp_str = datetime.now().strftime('%Y.%m.%d_%H.%M.%S')
+        output_pickle_path = os.path.join(self.model_dirname, f"all_future_trajectories__{timestamp_str}.pkl")
+        with open(output_pickle_path, "wb") as f:
+            pickle.dump(all_future_trajectories, f)
+
+    def _create_traj_dicts(self, raw_trajectories, max_number_of_agents=12):
+        from datasets.synth.create_data_npys import drop_distant
+        from datasets.synth.create_data_npys import center_scene
+        from datasets.synth.create_data_npys import shift
+        from datasets.synth.create_data_npys import theta_rotation
+
+        # Preprocess trajectories (center, rotate)
+        assert len(raw_trajectories) == 20
+        trajectories = drop_distant(raw_trajectories, max_num_peds=max_number_of_agents)
+        trajectories, rotation, center = center_scene(trajectories)
+        if trajectories.shape[1] < max_number_of_agents:
+            tmp_trajectories = np.zeros((20, max_number_of_agents, 2))
+            tmp_trajectories[:, :, :] = np.nan
+            tmp_trajectories[:, :trajectories.shape[1], :] = trajectories
+            trajectories = tmp_trajectories.copy()
+
+        # Prepare the trajectories for the forward pass
+        dataset: SynthV1Dataset = self.val_loader.dataset
+        data = dataset.unpack_datapoint(trajectories)
+        data = torch.utils.data.dataloader.default_collate([data])
+
+        # Forward pass
+        with torch.no_grad():
+            ego_in, ego_out, agents_in, agents_out, context_img, agent_types = self._data_to_device(data, "Joint")
+            roads = context_img
+            if "Ego" in self.model_config.model_type:
+                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+            elif "Joint" in self.model_config.model_type:
+                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, context_img, agent_types)
+                pred_obs = pred_obs[:, :, :, 0, :]
+            else:
+                raise ValueError
+
+        assert pred_obs.shape[0] == 1
+        assert pred_obs.shape[2] == 1
+        pred_future = pred_obs[0, :, 0, :2].cpu().numpy()
+        gt_past = raw_trajectories[:dataset.in_seq_len, 0]
+        gt_future = raw_trajectories[dataset.in_seq_len:, 0]
+
+        # Revert the trajectory preprocessing
+        def undo_preprocessing(t):
+            t = t[np.newaxis, ...]
+            t = theta_rotation(t, -rotation)
+            t = shift(t, -center)
+            t = t[0]
+            return t
+
+        pred_future = undo_preprocessing(pred_future)
+
+        # Sanity checks
+        gt_future_2 = undo_preprocessing(ego_out.cpu().numpy()[0, :, :2])
+        gt_past_2 = undo_preprocessing(ego_in.cpu().numpy()[0, :, :2])
+        assert np.allclose(gt_future, gt_future_2, atol=1e-5)
+        assert np.allclose(gt_past, gt_past_2, atol=1e-5)
+
+        # Pack the prediction
+        traj_dicts = {}
+        traj_dicts[0] = {
+            "gt_past": gt_past,
+            "gt_future": gt_future,
+            "pred_future": pred_future,
+        }
+        return traj_dicts
+
     def evaluate(self):
+        if self.args.synth_v1_cf_evaluation:
+            print(" EGO CF")
+            self.counterfactual_evaluate()
+            return
+
         if "Joint" in self.model_config.model_type:
+            print(" EGO")
+            self.autobotego_evaluate()
+            print(" JOINT")
             self.autobotjoint_evaluate()
         elif "Ego" in self.model_config.model_type:
+            print(" EGO")
             self.autobotego_evaluate()
         else:
             raise NotImplementedError
