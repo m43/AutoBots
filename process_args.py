@@ -80,6 +80,11 @@ def get_eval_args():
     parser.add_argument("--disable-cuda", action="store_true", help="Disable CUDA")
     parser.add_argument("--synth-v1-subset-filename", type=str, default="val.npy",
                         help="Filename of the synth-v1 subset to use for evaluation.")
+    parser.add_argument("--synth-v1-cf-evaluation", action="store_true",
+                        help="Whether to run the counterfactual evaluation instead of the standard evaluation")
+    parser.add_argument("--synth-v1-cf-evaluation-raw-synthv1-path", type=str,
+                        default="data/synth_v1.a.filtered.test.pkl",
+                        help="The relative path to the raw synth v1 dataset to run counterfactual evaluation on.")
     args = parser.parse_args()
 
     config, model_dirname = load_config(args.models_path)

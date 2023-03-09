@@ -293,7 +293,106 @@ class Evaluator:
                   "minADE_10", val_minade_10[0], "minADE_5", val_minade_5[0],
                   "minFDE_{}:".format(self.model_config.num_modes), val_minfde_c[0], "minFDE_1:", val_minfde_1[0])
 
+    def counterfactual_evaluate(self):
+        raw_synthv1_path = self.args.synth_v1_cf_evaluation_raw_synthv1_path
+        print(f"Counterfactual evaluation will use the raw dataset at: `{os.path.abspath(raw_synthv1_path)}`")
+        with open(raw_synthv1_path, "rb") as f:
+            dataset = pickle.load(f)
+
+        # TODO batchify to make it faster
+        # TODO refactor counterfactual evaluation, e.g. move it to a separate evaluator
+        all_future_trajectories = {}
+        for scene_idx, scene in enumerate(tqdm(dataset["scenes"])):
+            # Factual scene
+            f_traj = scene["trajectories"].transpose((1, 0, 2))
+            f_traj_dicts = self._create_traj_dicts(f_traj)
+
+            # Counterfactual scenes
+            cf_traj_list = [cf_traj.transpose((1, 0, 2)) for cf_traj in scene["remove_agent_i_trajectories"][1:]]
+            cf_traj_dicts_list = [{}] + [self._create_traj_dicts(cf_traj) for cf_traj in cf_traj_list]
+
+            all_future_trajectories[scene_idx] = {}
+            all_future_trajectories[scene_idx][7] = {
+                "factual": f_traj_dicts,
+                "counterfactuals": cf_traj_dicts_list,
+                "causal_effects": scene["remove_agent_i_ade"],
+            }
+
+        timestamp_str = datetime.now().strftime('%Y.%m.%d_%H.%M.%S')
+        output_pickle_path = os.path.join(self.model_dirname, f"all_future_trajectories__{timestamp_str}.pkl")
+        with open(output_pickle_path, "wb") as f:
+            pickle.dump(all_future_trajectories, f)
+
+    def _create_traj_dicts(self, raw_trajectories, max_number_of_agents=12):
+        from datasets.synth.create_data_npys import drop_distant
+        from datasets.synth.create_data_npys import center_scene
+        from datasets.synth.create_data_npys import shift
+        from datasets.synth.create_data_npys import theta_rotation
+
+        # Preprocess trajectories (center, rotate)
+        assert len(raw_trajectories) == 20
+        trajectories = drop_distant(raw_trajectories, max_num_peds=max_number_of_agents)
+        trajectories, rotation, center = center_scene(trajectories)
+        if trajectories.shape[1] < max_number_of_agents:
+            tmp_trajectories = np.zeros((20, max_number_of_agents, 2))
+            tmp_trajectories[:, :, :] = np.nan
+            tmp_trajectories[:, :trajectories.shape[1], :] = trajectories
+            trajectories = tmp_trajectories.copy()
+
+        # Prepare the trajectories for the forward pass
+        dataset: SynthV1Dataset = self.val_loader.dataset
+        data = dataset.unpack_datapoint(trajectories)
+        data = torch.utils.data.dataloader.default_collate([data])
+
+        # Forward pass
+        with torch.no_grad():
+            ego_in, ego_out, agents_in, agents_out, context_img, agent_types = self._data_to_device(data, "Joint")
+            roads = context_img
+            if "Ego" in self.model_config.model_type:
+                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
+            elif "Joint" in self.model_config.model_type:
+                pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, context_img, agent_types)
+                pred_obs = pred_obs[:, :, :, 0, :]
+            else:
+                raise ValueError
+
+        assert pred_obs.shape[0] == 1
+        assert pred_obs.shape[2] == 1
+        pred_future = pred_obs[0, :, 0, :2].cpu().numpy()
+        gt_past = raw_trajectories[:dataset.in_seq_len, 0]
+        gt_future = raw_trajectories[dataset.in_seq_len:, 0]
+
+        # Revert the trajectory preprocessing
+        def undo_preprocessing(t):
+            t = t[np.newaxis, ...]
+            t = theta_rotation(t, -rotation)
+            t = shift(t, -center)
+            t = t[0]
+            return t
+
+        pred_future = undo_preprocessing(pred_future)
+
+        # Sanity checks
+        gt_future_2 = undo_preprocessing(ego_out.cpu().numpy()[0, :, :2])
+        gt_past_2 = undo_preprocessing(ego_in.cpu().numpy()[0, :, :2])
+        assert np.allclose(gt_future, gt_future_2, atol=1e-5)
+        assert np.allclose(gt_past, gt_past_2, atol=1e-5)
+
+        # Pack the prediction
+        traj_dicts = {}
+        traj_dicts[0] = {
+            "gt_past": gt_past,
+            "gt_future": gt_future,
+            "pred_future": pred_future,
+        }
+        return traj_dicts
+
     def evaluate(self):
+        if self.args.synth_v1_cf_evaluation:
+            print(" EGO CF")
+            self.counterfactual_evaluate()
+            return
+
         if "Joint" in self.model_config.model_type:
             print(" EGO")
             self.autobotego_evaluate()
