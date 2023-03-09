@@ -196,7 +196,13 @@ class Trainer:
             epoch_fde_losses = []
             epoch_mode_probs = []
             for i, data in enumerate(self.train_loader):
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
+                if self.args.dataset == "synth" or "trajnet++" in self.args.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, _ = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+
                 pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
 
                 nll_loss, kl_loss, post_entropy, adefde_loss = nll_loss_multimodes(pred_obs, ego_out[:, :, :2], mode_probs,
@@ -261,7 +267,11 @@ class Trainer:
             val_fde_losses = []
             val_mode_probs = []
             for i, data in enumerate(self.val_loader):
-                ego_in, ego_out, agents_in, roads = self._data_to_device(data)
+                if self.args.dataset == "synth" or "trajnet++" in self.args.dataset:
+                    ego_in, ego_out, agents_in, _, context_img, _ = self._data_to_device(data, "Joint")
+                    roads = context_img
+                else:
+                    ego_in, ego_out, agents_in, roads = self._data_to_device(data)
 
                 # encode observations
                 pred_obs, mode_probs = self.autobot_model(ego_in, agents_in, roads)
